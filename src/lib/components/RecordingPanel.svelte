@@ -12,7 +12,7 @@
     retrigger: '同音高重触发：前一音符已在新触发时刻关闭',
     'cross-loop-gate': '跨循环尾部：门长已钳制为一格，不延续到下一轮',
     'gate-capped': '门长超过一格，已钳制为 100%',
-    'cell-overwrite': '同一格竞争：后到的音符胜出',
+    'cell-overwrite': '同一格竞争：onset 时刻较新的音符胜出，此处为落败的音符',
     'zero-velocity-off': '零力度 note-on 已按 note-off 处理',
     'orphan-off': '无配对 note-on 的 note-off 已忽略',
     incomplete: '确认时仍在悬挂的音符不完整，已丢弃'

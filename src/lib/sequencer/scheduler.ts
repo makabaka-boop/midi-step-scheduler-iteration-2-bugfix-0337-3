@@ -36,9 +36,14 @@
  * cancel every queued (unsent) message and immediately note-off every
  * wire key this scheduler started, so nothing can stick or fire twice.
  *
- * `locateBeat` exposes the current tempo grid for live-input recording:
- * a keyboard event's clock time maps to the global step boundary at or
- * before it, with the step duration in force (frozen per recorded note).
+ * `locateBeat` exposes the tempo grid for live-input recording: a keyboard
+ * event's clock time maps to the global step boundary at or before it,
+ * with the step duration in force (frozen per recorded note). The grid is
+ * kept as a short history of tempo segments (re-anchored at every play
+ * and tempo change), and a timestamp is mapped against the segment in
+ * force *at that timestamp* — so a message delivered late across a tempo
+ * change still lands on the cell, and freezes the step duration, of the
+ * tempo it was actually played under.
  * `stepsCommitted` reconciles one recorded take's cells as a single
  * ascending-order batch, so a confirmation applies like deterministic
  * manual edits without rewinding the clock or moving other tracks.
@@ -97,6 +102,13 @@ export interface SchedulerOptions {
 const DEFAULT_LOOKAHEAD_MS = 120;
 const DEFAULT_TICK_MS = 25;
 const DEFAULT_CATCH_UP_MS = 240;
+/**
+ * Tempo-grid segments retained for beat mapping. A segment is anchored at
+ * every play() and tempoChanged(); the history only needs to outlive the
+ * worst input-delivery lag, so a small bound is plenty (a burst of slider
+ * tempo changes still leaves many segments behind the current one).
+ */
+const MAX_GRID_SEGMENTS = 32;
 
 export class Scheduler {
   private readonly clock: Clock;
@@ -118,13 +130,14 @@ export class Scheduler {
   /** Last step boundary that came due (drives tempo-change re-planning). */
   private lastBoundary: { step: number; time: number } = { step: -1, time: 0 };
   /**
-   * Origin of the *current* tempo grid: the step/time anchor from which
-   * boundaries run at `stepDuration()` right now. A tempo change moves it
-   * to the boundary in force at the change, so live input is beat-mapped
-   * onto exactly the grid playback is using (independent of when ticks
-   * happen to dispatch).
+   * Tempo-grid segments, oldest first. Each segment starts at a step
+   * boundary where the grid was (re)anchored — playback start and every
+   * tempo change — and runs at the step duration in force there. Mapping
+   * a timestamp against the segment in force *at that timestamp* (rather
+   * than only the latest one) keeps a late-delivered message on the cell
+   * and step duration of the tempo it was actually played under.
    */
-  private gridAnchor: { step: number; time: number } = { step: 0, time: 0 };
+  private gridSegments: { step: number; time: number; stepDur: number }[] = [];
 
   /** Queued, not yet dispatched events — the "已排队消息". */
   private pending: ScheduledEvent[] = [];
@@ -222,7 +235,7 @@ export class Scheduler {
       time: this.nextStepTime - this.stepDuration()
     };
     // The current-tempo grid starts at the first step of this run.
-    this.gridAnchor = { step: this.stepIndex, time: this.nextStepTime };
+    this.pushGridSegment(this.stepIndex, this.nextStepTime);
     this.tick();
     return true;
   }
@@ -248,7 +261,7 @@ export class Scheduler {
     this.stepIndex = 0;
     this.nextStepTime = 0;
     this.lastBoundary = { step: -1, time: 0 };
-    this.gridAnchor = { step: 0, time: 0 };
+    this.gridSegments = [];
   }
 
   /**
@@ -262,8 +275,10 @@ export class Scheduler {
     this.dropUndispatched();
     this.rewindToLastBoundary();
     // From the change on, the grid runs at the new tempo from the next
-    // step boundary the replan anchored on.
-    this.gridAnchor = { step: this.stepIndex, time: this.nextStepTime };
+    // step boundary the replan anchored on. The previous segment stays in
+    // the history: a message timestamped before this boundary but
+    // delivered after it still maps onto the tempo it was played under.
+    this.pushGridSegment(this.stepIndex, this.nextStepTime);
   }
 
   /**
@@ -305,10 +320,11 @@ export class Scheduler {
    * Beat-map a clock timestamp onto the scheduler's global step grid.
    *
    * Used by the recorder to interpret live keyboard input against the
-   * *same* timeline the playback follows: the anchor is the last reached
-   * step boundary and the current step duration, so a tempo change only
-   * moves mapping for notes that arrive after it — already-played notes
-   * keep the duration captured when their note-on arrived, just as
+   * *same* timeline the playback follows. The timestamp is mapped against
+   * the tempo-grid segment in force at that timestamp — not the segment
+   * in force when the message happens to be processed — so a message
+   * delivered late across a tempo change keeps the cell and the step
+   * duration of the tempo it was actually played under, just as
    * already-dispatched playback history is never rewritten.
    *
    * Returns the global step whose boundary is at or immediately before
@@ -316,16 +332,33 @@ export class Scheduler {
    */
   locateBeat(timeMs: number): { step: number; time: number; stepDur: number } {
     const stepDur = Math.max(1, this.stepDuration());
-    if (this.lastBoundary.step < 0) {
+    if (this.lastBoundary.step < 0 || this.gridSegments.length === 0) {
       // Never started (or fully stopped): expose the conventional origin.
       return { step: 0, time: 0, stepDur };
     }
-    // Map against the current-tempo grid anchor (the boundary in force at
-    // the last play() / tempo change), which is exactly where playback's
-    // boundaries objectively fall — independent of tick dispatch timing.
-    const { step: anchorStep, time: anchorTime } = this.gridAnchor;
-    const k = Math.floor((timeMs - anchorTime) / stepDur);
-    return { step: anchorStep + k, time: anchorTime + k * stepDur, stepDur };
+    // The segment in force at the timestamp: the last one anchored at or
+    // before it (timestamps older than every retained segment clamp to
+    // the earliest one — still that era's grid, not today's).
+    let segment = this.gridSegments[0]!;
+    for (const candidate of this.gridSegments) {
+      if (candidate.time <= timeMs) segment = candidate;
+      else break;
+    }
+    const k = Math.floor((timeMs - segment.time) / segment.stepDur);
+    return {
+      step: segment.step + k,
+      time: segment.time + k * segment.stepDur,
+      stepDur: segment.stepDur
+    };
+  }
+
+  /**
+   * Current scheduler-clock time. The recording session stamps its take
+   * boundary with it: messages timestamped before a take was armed belong
+   * to an earlier take (or to no take) and must never enter its draft.
+   */
+  nowMs(): number {
+    return this.clock.now();
   }
 
   /**
@@ -720,5 +753,17 @@ export class Scheduler {
       this.clock.now(),
       this.lastBoundary.time + this.stepDuration()
     );
+  }
+
+  /**
+   * Anchor a new tempo-grid segment at a step boundary, freezing the step
+   * duration now in force. The history is bounded; the current segment is
+   * always retained.
+   */
+  private pushGridSegment(step: number, time: number): void {
+    this.gridSegments.push({ step, time, stepDur: Math.max(1, this.stepDuration()) });
+    if (this.gridSegments.length > MAX_GRID_SEGMENTS) {
+      this.gridSegments.splice(0, this.gridSegments.length - MAX_GRID_SEGMENTS);
+    }
   }
 }

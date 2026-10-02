@@ -540,6 +540,33 @@ describe('Scheduler beat mapping (recorder timeline)', () => {
     expect(scheduler.locateBeat(rig.clock.now()).step).toBe(2);
   });
 
+  it('maps a pre-change timestamp onto its own tempo segment (late delivery)', () => {
+    const rig = makeRig({ tracks: [{ length: 64, enabled: [] }] });
+    let tempo = BPM;
+    const scheduler = new Scheduler({
+      clock: rig.clock,
+      getPattern: () => rig.pattern,
+      getTempo: () => tempo
+    });
+    scheduler.setOutput(rig.out);
+    scheduler.play();
+    rig.clock.advance(250); // step 1 sounding (boundary 126); step 2 due 251
+    tempo = 240; // 62.5ms per step from t=250 on
+    scheduler.tempoChanged();
+    // A message timestamped before the change (played on the 125ms grid)
+    // but only processed now must keep its own segment's cell and step
+    // duration — t=140 belongs to step 1 at 125ms, not to whatever cell
+    // the new 62.5ms grid would compute backwards from the change.
+    const late = scheduler.locateBeat(140);
+    expect(late.step).toBe(1);
+    expect(late.stepDur).toBeCloseTo(STEP_MS, 5);
+    // …while a timestamp after the change maps onto the new grid.
+    rig.clock.advance(100); // t=350
+    const current = scheduler.locateBeat(rig.clock.now());
+    expect(current.step).toBe(3); // segment B: step 2 at t=250, step 3 at 312.5
+    expect(current.stepDur).toBeCloseTo(62.5, 4);
+  });
+
   it('returns the conventional origin when stopped', () => {
     const { scheduler } = makeRig({ tracks: [{ length: 8, enabled: [] }] });
     expect(scheduler.locateBeat(500).step).toBe(0);

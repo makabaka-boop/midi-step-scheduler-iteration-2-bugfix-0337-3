@@ -15,14 +15,18 @@ const STEP = 125; // 120 BPM, 16th grid
 
 /**
  * Controllable beat map: a uniform step grid starting at time 0, plus a
- * mutable playhead. Mirrors Scheduler.locateBeat's math (the boundary
- * at or immediately before the queried time).
+ * mutable playhead and a mutable clock. Mirrors Scheduler.locateBeat's
+ * math (the boundary at or immediately before the queried time).
  */
 class FakeBeatMap implements BeatMap {
   playing = 0;
+  now = 0;
   constructor(private readonly stepDur = STEP) {}
   get playingStep(): number {
     return this.playing;
+  }
+  nowMs(): number {
+    return this.now;
   }
   locateBeat(timeMs: number) {
     const k = Math.floor(timeMs / this.stepDur);
@@ -307,6 +311,69 @@ describe('RecordingSession arming preconditions', () => {
       expect(r.commit).toBeNull();
       expect(r.dropped).toBe(0);
     }).not.toThrow();
+  });
+});
+
+describe('RecordingSession take boundary and delivery order', () => {
+  it('ignores messages timestamped before the take was armed', () => {
+    const beat = new FakeBeatMap();
+    beat.now = 1000;
+    const session = new RecordingSession(beat);
+    session.arm('track-1', 0, 4);
+    // A note pair and a stray note-off from before the arm, delivered
+    // late: no cell, and no verdict noise either — they are not part of
+    // this take at all.
+    session.noteOn(0, 60, 100, 900);
+    session.noteOff(0, 60, 950);
+    session.noteOff(0, 64, 800);
+    expect(session.snapshot.cells.length).toBe(0);
+    expect(session.snapshot.verdicts.length).toBe(0);
+    // The take itself records normally from the arm moment on.
+    session.noteOn(0, 60, 100, 1000 + STEP);
+    session.noteOff(0, 60, 1000 + STEP + 40);
+    expect(session.snapshot.cells.map((c) => c.cell)).toEqual([1]);
+  });
+
+  it('a re-armed take rejects the previous take’s late leftovers', () => {
+    const beat = new FakeBeatMap();
+    const session = new RecordingSession(beat);
+    session.arm('track-1', 0, 4); // take 1 armed at t=0
+    session.noteOn(0, 60, 100, 2 * STEP);
+    session.noteOff(0, 60, 2 * STEP + 40);
+    expect(session.snapshot.cells.length).toBe(1);
+    session.cancel();
+
+    // Take 2 starts later; leftovers timestamped during take 1 but
+    // delivered now must not enter the new draft.
+    beat.now = 10 * STEP;
+    session.arm('track-1', 0, 4);
+    session.noteOn(0, 67, 100, 2 * STEP + 10);
+    session.noteOff(0, 67, 2 * STEP + 60);
+    expect(session.snapshot.cells.length).toBe(0);
+    expect(session.snapshot.verdicts.length).toBe(0);
+    // A fresh note timestamped after the re-arm records normally.
+    session.noteOn(0, 67, 100, 10 * STEP + 5);
+    session.noteOff(0, 67, 10 * STEP + 50);
+    expect(session.snapshot.cells.map((c) => c.cell)).toEqual([2]);
+  });
+
+  it('same-cell competition is judged by onset time, not delivery order', () => {
+    const { session } = makeSession(8);
+    // The newer onset (t=200) is delivered first; the older one (t=150)
+    // arrives late and must NOT overwrite it.
+    session.noteOn(0, 72, 100, 200);
+    session.noteOn(0, 60, 100, 150); // earlier onset, delivered later
+    expect(cellOf(session, 1)?.pitch).toBe(72);
+    // The stale loser's note-off pairs without disturbing the winner.
+    session.noteOff(0, 60, 180);
+    expect(cellOf(session, 1)?.pitch).toBe(72);
+    session.noteOff(0, 72, 260);
+    expect(cellOf(session, 1)).toMatchObject({ pitch: 72, open: false });
+    // The race is visible exactly once, naming the losing (stale) pitch.
+    const ow = session.snapshot.verdicts.filter((v) => v.kind === 'cell-overwrite');
+    expect(ow.length).toBe(1);
+    expect(ow[0]?.cell).toBe(1);
+    expect(ow[0]?.pitch).toBe(60);
   });
 });
 

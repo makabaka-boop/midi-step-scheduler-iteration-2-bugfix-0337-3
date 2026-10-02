@@ -18,12 +18,19 @@
  *   note closes at the new trigger time (gate clamped, never negative);
  * - notes longer than a cell are clamped to gate 1.0; a note that hangs
  *   across the loop tail is clamped without smearing into the next loop;
- * - two onsets competing for one cell: the later onset wins, the earlier
- *   record is displaced with a visible verdict;
+ * - two onsets competing for one cell: the later *onset* wins — decided
+ *   by the messages' own timestamps, never by delivery order — and the
+ *   losing record is displaced with a visible verdict;
  * - zero-velocity note-on is a note-off (MIDI convention);
  * - a note-off without a note-on is ignored;
  * - a note still held at confirm time is an incomplete pair: dropped,
  *   never committed half-open.
+ *
+ * The take has a hard boundary on the scheduler clock: anything
+ * timestamped before the take was armed — a previous take's leftover
+ * delivered late, or idle playing before record was enabled — is not
+ * part of this performance. It writes no cell and no verdict, so a
+ * cancelled take can never leak into the next take's draft.
  *
  * The session is framework-free; the controller republishes its
  * snapshots through a Svelte store so the input adapter, beat mapping,
@@ -100,6 +107,8 @@ export interface BeatMap {
   locateBeat(timeMs: number): { step: number; time: number; stepDur: number };
   /** Global step the playhead is currently on (>= 0 while playing). */
   playingStep: number;
+  /** Current scheduler-clock time; stamps the take boundary at arming. */
+  nowMs(): number;
 }
 
 interface OpenVoice {
@@ -137,11 +146,17 @@ export class RecordingSession {
   /** Global step the take was anchored on (start of pass 0). */
   private anchorStep = 0;
   private pass = 0;
+  /**
+   * Scheduler-clock time this take was armed. Messages timestamped before
+   * it belong to an earlier take (or to no take) and are ignored outright.
+   */
+  private armedAtMs = 0;
 
   /** Currently held keyboard keys, keyed by pitch (single channel). */
   private open = new Map<number, OpenVoice>();
-  /** One winning draft entry per cell; values carry the owning voice id. */
-  private cells = new Map<number, DraftStep & { voiceId: number }>();
+  /** One winning draft entry per cell; values carry the owning voice id
+   *  and the winning onset time (cell races are judged by timestamps). */
+  private cells = new Map<number, DraftStep & { voiceId: number; onTime: number }>();
   private verdicts: RecordVerdict[] = [];
   private voiceSeq = 0;
   private listener: ((snapshot: RecordingSnapshot) => void) | null = null;
@@ -188,6 +203,9 @@ export class RecordingSession {
     this.armedTrackId = trackId;
     this.channel = channel;
     this.length = length;
+    // The take boundary on the scheduler clock: only messages timestamped
+    // from this moment on belong to this take.
+    this.armedAtMs = this.beat.nowMs();
     // Anchor the take on the step the playhead is currently crossing;
     // notes arriving before the next boundary belong to that cell.
     this.anchorStep = Math.max(0, this.beat.playingStep);
@@ -264,6 +282,10 @@ export class RecordingSession {
   noteOn(channel: number, pitch: number, velocity: number, timeMs: number): void {
     if (!this.armedTrackId || channel !== this.channel || velocity <= 0) return;
     if (!this.beat) return;
+    // Older than the take itself: a leftover from a previous take (or an
+    // idle keyboard) delivered late. It is not part of this performance —
+    // it must not write a cell, a verdict or any other trace here.
+    if (timeMs < this.armedAtMs) return;
 
     // Same-pitch retrigger: close the previous instance at exactly the
     // new trigger time, so the two never overlap and its gate is real.
@@ -289,11 +311,18 @@ export class RecordingSession {
     };
     this.open.set(pitch, voice);
 
-    // One cell carries at most one note: the later onset wins. The note
-    // it displaces (complete or still held by another pitch) is reported
-    // rather than silently overwritten.
+    // One cell carries at most one note, and the later *onset* wins — by
+    // the messages' own timestamps, not by arrival order. A note that is
+    // delivered late but was played before the cell's current owner has
+    // already lost: its voice stays open only so its note-off can pair,
+    // and the loss is reported rather than silently dropped.
     const occupant = this.cells.get(voice.cell);
     if (occupant && occupant.voiceId !== voice.id && occupant.cell !== retriggeredCell) {
+      if (occupant.onTime > timeMs) {
+        this.pushVerdict('cell-overwrite', voice.cell, pitch, timeMs);
+        this.emit();
+        return;
+      }
       this.pushVerdict('cell-overwrite', voice.cell, occupant.pitch, timeMs);
     }
     this.cells.set(voice.cell, {
@@ -302,13 +331,17 @@ export class RecordingSession {
       velocity,
       gate: MAX_GATE,
       open: true,
-      voiceId: voice.id
+      voiceId: voice.id,
+      onTime: timeMs
     });
     this.emit();
   }
 
   noteOff(channel: number, pitch: number, timeMs: number, zeroVelocity = false): void {
     if (!this.armedTrackId || channel !== this.channel) return;
+    // Same take boundary as noteOn: a leftover from before this take was
+    // armed leaves no trace — not even an orphan verdict.
+    if (timeMs < this.armedAtMs) return;
     const voice = this.open.get(pitch);
     if (!voice) {
       // A close without an open note cannot form a pair — ignore it, but
@@ -355,7 +388,8 @@ export class RecordingSession {
         velocity: voice.velocity,
         gate,
         open: false,
-        voiceId: voice.id
+        voiceId: voice.id,
+        onTime: voice.onTime
       });
     }
 
@@ -391,6 +425,7 @@ export class RecordingSession {
     this.channel = 0;
     this.length = 0;
     this.anchorStep = 0;
+    this.armedAtMs = 0;
     this.pass = 0;
     this.open.clear();
     this.cells.clear();

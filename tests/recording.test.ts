@@ -191,6 +191,27 @@ describe('record-while-playing integration', () => {
     expect(get(controller.pattern).tracks[0]!.steps[0]!.pitch).toBe(80);
   });
 
+  it('same-cell competition is judged by onset time, not delivery order', async () => {
+    const rig = await makeRig(16, []);
+    const { clock, controller, trackId } = rig;
+    controller.play();
+    clock.advance(500); // cell 3 (boundaries 1+125k; 376 ≤ 500 < 501)
+    controller.armRecording(trackId); // take boundary: t=500
+    // The newer onset (t=520) is delivered first; the older one (t=505)
+    // arrives late and must not overwrite it. Both quantize to cell 4.
+    rig.input.emit([0x90, 80, 100], 520);
+    rig.input.emit([0x90, 60, 100], 505); // earlier onset, delivered later
+    rig.input.emit([0x80, 60, 0], 515);
+    rig.input.emit([0x80, 80, 0], 560);
+    const rec = get(controller.recording);
+    expect(rec.cells.map((c) => c.cell)).toEqual([4]);
+    expect(rec.cells[0]?.pitch).toBe(80);
+    expect(rec.verdicts.some((v) => v.kind === 'cell-overwrite')).toBe(true);
+    controller.confirmRecording();
+    expect(get(controller.pattern).tracks[0]!.steps[4]!.pitch).toBe(80);
+    controller.stop();
+  });
+
   it('zero-velocity note-on is treated as note-off', async () => {
     const rig = await makeRig(16, []);
     const { clock, controller, trackId } = rig;
@@ -257,6 +278,35 @@ describe('recording under tempo changes', () => {
     const cells = get(controller.pattern).tracks[0]!.steps;
     expect(cells[1]!.pitch).toBe(60);
     expect(cells[targetCell]!.pitch).toBe(70);
+  });
+
+  it('a message delivered late across a tempo change keeps its own tempo segment', async () => {
+    const rig = await makeRig(16, []);
+    const { clock, controller, trackId } = rig;
+    controller.play();
+    clock.advance(100); // cell 0 on the 125ms grid
+    controller.armRecording(trackId); // take boundary: t=100
+    // The key is pressed at t=140 and released at t=170 (cell 1, a 30ms
+    // gate on the 125ms grid), but the messages are only delivered at
+    // t=300 — after a tempo change to 240 BPM at t=250.
+    clock.advance(150); // t=250
+    controller.setTempo(240);
+    clock.advance(50); // t=300: the stale messages finally arrive
+    rig.input.emit([0x90, 64, 100], 140);
+    rig.input.emit([0x80, 64, 0], 170);
+
+    const rec = get(controller.recording);
+    // Cell 1 on the old grid — not wherever the new grid would place a
+    // backwards-computed t=140 — and the gate is measured in the old
+    // segment's 125ms steps, not the new 62.5ms ones.
+    const cell = rec.cells.find((c) => c.pitch === 64);
+    expect(cell?.cell).toBe(1);
+    expect(cell?.gate).toBeCloseTo(30 / 125, 5);
+    controller.confirmRecording();
+    const steps = get(controller.pattern).tracks[0]!.steps;
+    expect(steps[1]!.pitch).toBe(64);
+    expect(steps[1]!.gate).toBeCloseTo(30 / 125, 5);
+    controller.stop();
   });
 });
 
@@ -375,6 +425,43 @@ describe('discarding an unconfirmed take', () => {
     expect(get(controller.transport)).toBe('playing');
     clock.advance(1200);
     expect(ons(rig.output).length).toBeGreaterThan(1);
+    controller.stop();
+  });
+
+  it('leftovers from a cancelled take cannot leak into the next take', async () => {
+    const rig = await makeRig(8, []);
+    const { clock, controller, trackId } = rig;
+    controller.play();
+    clock.advance(100);
+    controller.armRecording(trackId); // take 1 armed at t=100
+    emitNow(rig, [0x90, 60, 100]); // t=100 → cell 0
+    clock.advance(40);
+    emitNow(rig, [0x80, 60, 0]);
+    expect(get(controller.recording).cells.length).toBe(1);
+    controller.cancelRecording();
+
+    // Rehearser immediately starts a new take; messages timestamped in
+    // the cancelled take's lifetime but delivered only now must not
+    // enter the new draft — not even as verdict noise.
+    clock.advance(260); // t=400
+    controller.armRecording(trackId); // take 2 armed at t=400
+    rig.input.emit([0x90, 67, 100], 150); // take-1 leftover, delivered late
+    rig.input.emit([0x80, 67, 0], 190);
+    rig.input.emit([0x80, 72, 0], 180); // stray off from take 1: no orphan verdict
+    let rec = get(controller.recording);
+    expect(rec.cells.length).toBe(0);
+    expect(rec.verdicts.length).toBe(0);
+
+    // The new take records its own performance and commits only that.
+    emitNow(rig, [0x90, 65, 100]); // t=400 → cell 3
+    clock.advance(40);
+    emitNow(rig, [0x80, 65, 0]);
+    rec = get(controller.recording);
+    expect(rec.cells.map((c) => c.cell)).toEqual([3]);
+    controller.confirmRecording();
+    const steps = get(controller.pattern).tracks[0]!.steps;
+    expect(steps[3]!.pitch).toBe(65);
+    expect(steps[0]!.enabled).toBe(false); // cancelled take 1 left nothing
     controller.stop();
   });
 
