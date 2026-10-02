@@ -540,6 +540,88 @@ describe('Scheduler beat mapping (recorder timeline)', () => {
     expect(scheduler.locateBeat(rig.clock.now()).step).toBe(2);
   });
 
+  it('locates a late-delivered timestamp on the grid in force at that moment', () => {
+    const rig = makeRig({ tracks: [{ length: 64, enabled: [] }] });
+    let tempo = BPM;
+    const scheduler = new Scheduler({
+      clock: rig.clock,
+      getPattern: () => rig.pattern,
+      getTempo: () => tempo
+    });
+    scheduler.setOutput(rig.out);
+    scheduler.play();
+    rig.clock.advance(110); // step 0 sounding on the 125ms grid
+    tempo = 240; // 62.5ms per step from the replan on
+    scheduler.tempoChanged();
+    rig.clock.advance(200);
+
+    // A message timestamped before the change but delivered after it is
+    // located on the OLD grid, with the OLD step duration — never as a
+    // negative step on the new grid extrapolated backwards.
+    const early = scheduler.locateBeat(40);
+    expect(early.step).toBe(0);
+    expect(early.stepDur).toBeCloseTo(STEP_MS, 5);
+    const atBoundary = scheduler.locateBeat(100);
+    expect(atBoundary.step).toBe(0); // step 1's old-grid boundary is t=126
+    // Timestamps after the change still map onto the new grid.
+    expect(scheduler.locateBeat(rig.clock.now()).stepDur).toBeCloseTo(62.5, 4);
+  });
+
+  it('stretches the tail step of a superseded grid up to the new grid’s start', () => {
+    const rig = makeRig({ tracks: [{ length: 64, enabled: [] }] });
+    let tempo = BPM;
+    const scheduler = new Scheduler({
+      clock: rig.clock,
+      getPattern: () => rig.pattern,
+      getTempo: () => tempo
+    });
+    scheduler.setOutput(rig.out);
+    scheduler.play();
+    rig.clock.advance(110); // step 0 sounding (boundary t=1)
+    tempo = 60; // 250ms per step: step 0 now rings until t=251
+    scheduler.tempoChanged();
+
+    // t=200 is objectively still step 0 (its boundary was stretched to
+    // 251 by the replan) — not step 1 of the old 125ms grid.
+    const tail = scheduler.locateBeat(200);
+    expect(tail.step).toBe(0);
+    expect(tail.stepDur).toBeCloseTo(250, 4); // the tail step's true length
+    // Deeper in the past the old uniform grid still applies.
+    expect(scheduler.locateBeat(100).step).toBe(0);
+    expect(scheduler.locateBeat(100).stepDur).toBeCloseTo(STEP_MS, 5);
+    // And the new grid takes over from its first boundary.
+    expect(scheduler.locateBeat(260).step).toBe(1);
+  });
+
+  it('keeps every tempo change addressable for late messages across several changes', () => {
+    const rig = makeRig({ tracks: [{ length: 64, enabled: [] }] });
+    let tempo = BPM;
+    const scheduler = new Scheduler({
+      clock: rig.clock,
+      getPattern: () => rig.pattern,
+      getTempo: () => tempo
+    });
+    scheduler.setOutput(rig.out);
+    scheduler.play(); // 120 BPM, 125ms steps from t=1
+    rig.clock.advance(110);
+    tempo = 240; // 62.5ms steps
+    scheduler.tempoChanged();
+    rig.clock.advance(70); // a couple of fast steps
+    tempo = BPM; // back to 125ms steps
+    scheduler.tempoChanged();
+    rig.clock.advance(300);
+
+    // A message from the first (125ms) era still locates there…
+    expect(scheduler.locateBeat(40).step).toBe(0);
+    expect(scheduler.locateBeat(40).stepDur).toBeCloseTo(STEP_MS, 5);
+    // …one from the fast era gets 62.5ms steps…
+    const fastEra = scheduler.locateBeat(140);
+    expect(fastEra.stepDur).toBeCloseTo(62.5, 4);
+    expect(fastEra.step).toBeGreaterThanOrEqual(1);
+    // …and current input follows the restored 125ms grid.
+    expect(scheduler.locateBeat(rig.clock.now()).stepDur).toBeCloseTo(STEP_MS, 5);
+  });
+
   it('returns the conventional origin when stopped', () => {
     const { scheduler } = makeRig({ tracks: [{ length: 8, enabled: [] }] });
     expect(scheduler.locateBeat(500).step).toBe(0);

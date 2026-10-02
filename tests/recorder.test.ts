@@ -15,14 +15,19 @@ const STEP = 125; // 120 BPM, 16th grid
 
 /**
  * Controllable beat map: a uniform step grid starting at time 0, plus a
- * mutable playhead. Mirrors Scheduler.locateBeat's math (the boundary
- * at or immediately before the queried time).
+ * mutable playhead and clock. Mirrors Scheduler.locateBeat's math (the
+ * boundary at or immediately before the queried time).
  */
 class FakeBeatMap implements BeatMap {
   playing = 0;
+  /** The fake "now" the session anchors its takes on. */
+  clockTime = 0;
   constructor(private readonly stepDur = STEP) {}
   get playingStep(): number {
     return this.playing;
+  }
+  now(): number {
+    return this.clockTime;
   }
   locateBeat(timeMs: number) {
     const k = Math.floor(timeMs / this.stepDur);
@@ -224,6 +229,70 @@ describe('RecordingSession zero velocity and stray events', () => {
     session.noteOn(2, 60, 100, 0);
     session.noteOff(2, 60, 50);
     expect(cellOf(session, 0)).not.toBeNull();
+  });
+});
+
+describe('RecordingSession take-time and arrival-order evidence', () => {
+  it('rejects messages timestamped before the take was armed', () => {
+    const beat = new FakeBeatMap();
+    beat.clockTime = 1000; // the take starts at t=1000 on the shared clock
+    const session = new RecordingSession(beat);
+    session.arm('track-1', 0, 4);
+    // Leftovers from a previous round, delivered late: never drafted.
+    session.noteOn(0, 60, 100, 500);
+    session.noteOff(0, 60, 600);
+    expect(session.snapshot.cells.length).toBe(0);
+    expect(
+      session.snapshot.verdicts.filter((v) => v.kind === 'stale-message').length
+    ).toBe(2);
+    expect(session.snapshot.verdicts.some((v) => v.kind === 'orphan-off')).toBe(false);
+    // Messages of this take still record normally.
+    session.noteOn(0, 64, 100, 1100);
+    session.noteOff(0, 64, 1150);
+    expect(session.snapshot.cells.length).toBe(1);
+  });
+
+  it('same-cell competition is decided by onset time, not delivery order', () => {
+    const { session } = makeSession(8);
+    // The newer onset (t=+30) is delivered first; the older one (t=+10)
+    // arrives late and must not overwrite the newer performance.
+    session.noteOn(0, 72, 100, 2 * STEP + 30);
+    session.noteOff(0, 72, 2 * STEP + 90);
+    session.noteOn(0, 60, 100, 2 * STEP + 10);
+    session.noteOff(0, 60, 2 * STEP + 40);
+    expect(cellOf(session, 2)?.pitch).toBe(72);
+    expect(session.snapshot.verdicts.some((v) => v.kind === 'stale-message')).toBe(true);
+    // The late loser's note-off still paired cleanly: no orphan verdict.
+    expect(session.snapshot.verdicts.some((v) => v.kind === 'orphan-off')).toBe(false);
+  });
+
+  it('a late older onset does not displace a newer note still being held', () => {
+    const { session } = makeSession(8);
+    session.noteOn(0, 72, 100, 2 * STEP + 30); // held, owns cell 2
+    session.noteOn(0, 60, 100, 2 * STEP + 10); // older onset, delivered late
+    session.noteOff(0, 72, 2 * STEP + 90);
+    expect(cellOf(session, 2)?.pitch).toBe(72);
+    expect(cellOf(session, 2)?.open).toBe(false);
+  });
+
+  it('an out-of-order onset does not close the newer held note of the same pitch', () => {
+    const { session } = makeSession(8);
+    session.noteOn(0, 60, 100, 100); // held
+    session.noteOn(0, 60, 80, 50); // stale duplicate: ignored, no retrigger
+    session.noteOff(0, 60, 220);
+    expect(cellOf(session, 0)?.velocity).toBe(100); // the newer note intact
+    expect(cellOf(session, 0)?.gate).toBeCloseTo(120 / STEP, 5);
+    expect(session.snapshot.verdicts.some((v) => v.kind === 'retrigger')).toBe(false);
+  });
+
+  it('a note-off older than the held onset is ignored as stale', () => {
+    const { session } = makeSession(8);
+    session.noteOn(0, 60, 100, 100);
+    session.noteOff(0, 60, 80); // predates the onset: not this note's close
+    expect(cellOf(session, 0)?.open).toBe(true);
+    session.noteOff(0, 60, 220);
+    expect(cellOf(session, 0)?.open).toBe(false);
+    expect(cellOf(session, 0)?.gate).toBeCloseTo(120 / STEP, 5);
   });
 });
 

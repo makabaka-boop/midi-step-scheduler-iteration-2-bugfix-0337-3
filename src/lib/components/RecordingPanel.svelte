@@ -13,6 +13,7 @@
     'cross-loop-gate': '跨循环尾部：门长已钳制为一格，不延续到下一轮',
     'gate-capped': '门长超过一格，已钳制为 100%',
     'cell-overwrite': '同一格竞争：后到的音符胜出',
+    'stale-message': '迟到的旧消息：时间戳落后于本轮演奏，已忽略',
     'zero-velocity-off': '零力度 note-on 已按 note-off 处理',
     'orphan-off': '无配对 note-on 的 note-off 已忽略',
     incomplete: '确认时仍在悬挂的音符不完整，已丢弃'
@@ -23,6 +24,7 @@
     'cross-loop-gate': 'cross-loop',
     'gate-capped': 'gate-capped',
     'cell-overwrite': 'cell-overwrite',
+    'stale-message': 'stale-message',
     'zero-velocity-off': 'zero-velocity',
     'orphan-off': 'orphan-off',
     incomplete: 'incomplete'

@@ -260,6 +260,83 @@ describe('recording under tempo changes', () => {
   });
 });
 
+describe('late messages across tempo changes and take boundaries', () => {
+  it('a note delivered late across a tempo change lands in its true cell with its true gate', async () => {
+    const rig = await makeRig(16, []);
+    const { clock, controller, trackId } = rig;
+    controller.play();
+    clock.advance(40); // t=40, cell 0 on the 125ms grid
+    controller.armRecording(trackId);
+    // The key is physically pressed at t=50 and released at t=110 (60% of
+    // a 125ms step), but the messages are only delivered at t=320 — after
+    // a tempo change at t=252 replanned the grid to 250ms steps.
+    clock.advance(212); // t=252, cell 2
+    controller.setTempo(60);
+    clock.advance(68); // t=320
+    rig.input.emit([0x90 | rig.channel, 67, 90], 50);
+    rig.input.emit([0x80 | rig.channel, 67, 0], 110);
+    const draft = get(controller.recording);
+    const cell = draft.cells.find((c) => c.pitch === 67);
+    expect(cell?.cell).toBe(0); // pressed during cell 0 on the 125ms grid
+    expect(cell?.gate).toBeCloseTo(0.48, 2); // 60ms of the 125ms step
+    controller.confirmRecording();
+    const steps = get(controller.pattern).tracks[0]!.steps;
+    expect(steps[0]!.pitch).toBe(67);
+    expect(steps[0]!.gate).toBeCloseTo(0.48, 2);
+    expect(steps[1]!.enabled).toBe(false); // not smeared onto a neighbour
+    controller.stop();
+  });
+
+  it('a cancelled round’s late messages cannot enter the next take', async () => {
+    const rig = await makeRig(8, []);
+    const { clock, controller, trackId } = rig;
+    controller.play();
+    clock.advance(100); // t=100, cell 0
+    controller.armRecording(trackId);
+    // First take: a note is played at t=130..190, but its messages are
+    // still in flight when the take is cancelled at t=200.
+    clock.advance(100); // t=200
+    controller.cancelRecording();
+    // A new take starts immediately; only now do the old messages arrive.
+    controller.armRecording(trackId);
+    rig.input.emit([0x90 | rig.channel, 61, 100], 130);
+    rig.input.emit([0x80 | rig.channel, 61, 0], 190);
+    const rec = get(controller.recording);
+    expect(rec.cells.length).toBe(0); // the old round is kept out
+    expect(rec.verdicts.some((v) => v.kind === 'stale-message')).toBe(true);
+    // The new take records its own performance and commits only that.
+    clock.advance(60); // t=260, cell 2 (boundary 251)
+    rig.input.emit([0x90 | rig.channel, 65, 100], clock.now());
+    clock.advance(50);
+    rig.input.emit([0x80 | rig.channel, 65, 0], clock.now());
+    controller.confirmRecording();
+    const steps = get(controller.pattern).tracks[0]!.steps;
+    expect(steps[2]!.pitch).toBe(65);
+    expect(steps.some((s) => s.pitch === 61)).toBe(false); // no leftover committed
+    controller.stop();
+  });
+
+  it('same-cell competition follows onset time, not delivery order', async () => {
+    const rig = await makeRig(16, []);
+    const { clock, controller, trackId } = rig;
+    controller.play();
+    clock.advance(100); // t=100, cell 0
+    controller.armRecording(trackId);
+    // The newer onset (t=115) is delivered first; the older one (t=105)
+    // arrives late and must not overwrite the newer performance.
+    rig.input.emit([0x90 | rig.channel, 80, 100], 115);
+    rig.input.emit([0x80 | rig.channel, 80, 0], 155);
+    rig.input.emit([0x90 | rig.channel, 60, 100], 105);
+    rig.input.emit([0x80 | rig.channel, 60, 0], 145);
+    const rec = get(controller.recording);
+    expect(rec.cells.find((c) => c.cell === 0)?.pitch).toBe(80);
+    expect(rec.verdicts.some((v) => v.kind === 'stale-message')).toBe(true);
+    controller.confirmRecording();
+    expect(get(controller.pattern).tracks[0]!.steps[0]!.pitch).toBe(80);
+    controller.stop();
+  });
+});
+
 describe('recording commit output ordering', () => {
   it('applies the batch with deterministic, timestamp-ordered messages', async () => {
     const rig = await makeRig(8, []);
